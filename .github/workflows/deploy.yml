@@ -1,4 +1,4 @@
-name: Deploy nginx to EC2
+name: Deploy nginx to ECS Fargate
 
 on:
   workflow_dispatch:
@@ -11,11 +11,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  provision:
-    name: Provision EC2
+  terraform:
+    name: Provision ECS Infrastructure
     runs-on: ubuntu-latest
-    outputs:
-      server_ip: ${{ steps.get_ip.outputs.ip }}
 
     steps:
       - uses: actions/checkout@v4
@@ -27,182 +25,151 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Check existing AWS resources
-        id: check_ec2
+      - name: Ensure S3 state bucket exists
         run: |
-          PROJECT="${{ secrets.PROJECT_NAME }}"
-          EXISTING_IP=$(aws ec2 describe-instances \
-            --filters "Name=tag:Project,Values=$PROJECT" \
-                      "Name=instance-state-name,Values=running" \
-            --query "Reservations[0].Instances[0].PublicIpAddress" \
-            --output text 2>/dev/null || echo "None")
-
-          KEY_EXISTS=$(aws ec2 describe-key-pairs \
-            --filters "Name=key-name,Values=$PROJECT-key" \
-            --query "KeyPairs[0].KeyName" --output text 2>/dev/null || echo "None")
-
-          SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=$PROJECT-sg" \
-            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
-
-          if [ "$EXISTING_IP" != "None" ] && [ "$EXISTING_IP" != "null" ] && [ -n "$EXISTING_IP" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "ip=$EXISTING_IP" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-          echo "key_exists=$KEY_EXISTS" >> $GITHUB_OUTPUT
-          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+          aws s3api head-bucket --bucket ${{ secrets.TF_STATE_BUCKET }} \
+            || aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
 
-      # 🔎 DEBUG STEP
-      - name: Debug AWS identity and S3 state
-        run: |
-          echo "Checking AWS identity..."
-          aws sts get-caller-identity
-
-          echo "Checking S3 bucket..."
-          aws s3 ls s3://${{ secrets.TF_STATE_BUCKET }}
-
-          echo "Checking Terraform state path..."
-          aws s3api head-object \
-            --bucket ${{ secrets.TF_STATE_BUCKET }} \
-            --key ${{ secrets.PROJECT_NAME }}/terraform.tfstate || true
-
-      - name: Create S3 state bucket
-        if: steps.check_ec2.outputs.exists != 'true'
-        run: |
-          aws s3api head-bucket --bucket ${{ secrets.TF_STATE_BUCKET }} \
-          || aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }}
-
       - name: Terraform Init
-        if: steps.check_ec2.outputs.exists != 'true'
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
         working-directory: terraform
 
-      - name: Import existing resources
-        if: steps.check_ec2.outputs.exists != 'true'
-        run: |
-          KEY="${{ steps.check_ec2.outputs.key_exists }}"
-          SG="${{ steps.check_ec2.outputs.sg_id }}"
-
-          [ "$KEY" != "None" ] && terraform import \
-            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
-            -var="project_name=${{ secrets.PROJECT_NAME }}" \
-            -var="aws_region=${{ secrets.AWS_REGION }}" \
-            aws_key_pair.deployer "${{ secrets.PROJECT_NAME }}-key" 2>/dev/null || true
-
-          [ "$SG" != "None" ] && terraform import \
-            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
-            -var="project_name=${{ secrets.PROJECT_NAME }}" \
-            -var="aws_region=${{ secrets.AWS_REGION }}" \
-            aws_security_group.sg "$SG" 2>/dev/null || true
-        working-directory: terraform
-
-      - name: Terraform Plan
-        if: steps.check_ec2.outputs.exists != 'true'
-        run: |
-          terraform plan \
-            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
-            -var="project_name=${{ secrets.PROJECT_NAME }}" \
-            -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -out=tfplan
-        working-directory: terraform
-
       - name: Terraform Apply
-        if: steps.check_ec2.outputs.exists != 'true'
-        run: terraform apply -auto-approve tfplan
-        working-directory: terraform
-
-      - name: Get IP
-        id: get_ip
         run: |
-          if [ "${{ steps.check_ec2.outputs.exists }}" == "true" ]; then
-            echo "ip=${{ steps.check_ec2.outputs.ip }}" >> $GITHUB_OUTPUT
-          else
-            echo "ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
-          fi
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
         working-directory: terraform
 
-
-  configure:
-    name: Configure nginx
+  build-and-push:
+    name: Build and Push to ECR
     runs-on: ubuntu-latest
-    needs: provision
+    needs: terraform
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ansible
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+
+      - name: Build and push Docker image
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ansible
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ secrets.PROJECT_NAME }}:${{ github.sha }}"
+          IMAGE_LATEST="${{ steps.login-ecr.outputs.registry }}/${{ secrets.PROJECT_NAME }}:latest"
+          docker build -t $IMAGE .
+          docker tag $IMAGE $IMAGE_LATEST
+          docker push $IMAGE
+          docker push $IMAGE_LATEST
 
-      - name: Write SSH private key
-        run: |
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
-          chmod 600 /tmp/deploy_key
-
-      - name: Wait for SSH
-        run: |
-          for i in $(seq 1 30); do
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-              -i /tmp/deploy_key ${{ secrets.SSH_USER || 'ubuntu' }}@${{ needs.provision.outputs.server_ip }} echo ok \
-              && break || sleep 10
-          done
-
-      - name: Run Ansible
-        run: |
-          ansible-playbook \
-            -i "${{ needs.provision.outputs.server_ip }}," \
-            --private-key /tmp/deploy_key \
-            -u ${{ secrets.SSH_USER }} \
-            playbook.yml
-        working-directory: ansible
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-          ANSIBLE_HOST_KEY_CHECKING: "False"
-
-
-  verify:
-    name: Verify deployment
+  deploy-ecs:
+    name: Deploy to ECS
     runs-on: ubuntu-latest
-    needs: [provision, configure]
+    needs: build-and-push
 
     steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.PROJECT_NAME }}-cluster \
+            --service ${{ secrets.PROJECT_NAME }}-service \
+            --force-new-deployment
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: deploy-ecs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+        working-directory: terraform
+
+      - name: Get ALB URL
+        id: alb
+        run: |
+          ALB_URL=$(terraform output -raw alb_url)
+          echo "url=$ALB_URL" >> $GITHUB_OUTPUT
+        working-directory: terraform
+
       - name: Health check
         run: |
-          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          for i in $(seq 1 12); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://$SERVER_IP/ || echo "000")
+          ALB_URL="${{ steps.alb.outputs.url }}"
+          echo "Waiting for ECS service to stabilize..."
+          sleep 30
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$ALB_URL" || echo "000")
             if [ "$STATUS" = "200" ]; then
               echo "Health check passed with HTTP $STATUS"
               exit 0
             fi
-            echo "Attempt $i: HTTP $STATUS — retrying in 10s..."
-            sleep 10
+            echo "Attempt $i: HTTP $STATUS — retrying in 15s..."
+            sleep 15
           done
           echo "Health check failed after all attempts"
           exit 1
 
-
   notify:
-    name: Notify live URL
+    name: Notify Live URL
     runs-on: ubuntu-latest
-    needs: [provision, configure, verify]
+    needs: [deploy-ecs, verify]
 
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
       - name: Print live URL
         run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+          ALB_URL=$(terraform output -raw alb_url)
           echo "==========================================="
-          echo "  nginx is live!"
-          echo "  URL: http://${{ needs.provision.outputs.server_ip }}"
+          echo "  nginx is live on ECS Fargate!"
+          echo "  URL: $ALB_URL"
           echo "==========================================="
+        working-directory: terraform
